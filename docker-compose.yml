@@ -1,7 +1,7 @@
 services:
   rain-api:
     build: .
-    image: rain-batch-api:1.0.0
+    image: rain-batch-api:1.1.0
     container_name: rain-batch-api
     ports:
       - "8000:8000"

@@ -26,3 +26,15 @@ class MergeFailedError(StorageError):
 
 class NotFoundError(StorageError):
     status_code = 404
+
+
+class StationChangeConflictError(StorageError):
+    """A physical station would belong to two logical stations at once."""
+
+    status_code = 409
+
+
+class QueryReadError(StorageError):
+    """A published Parquet file could not be read; no partial result is served."""
+
+    status_code = 500

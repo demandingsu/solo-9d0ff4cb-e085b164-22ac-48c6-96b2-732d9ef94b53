@@ -155,21 +155,11 @@ def _release_merge_lock(conn: sqlite3.Connection, station_id: str, day: str) -> 
 
 
 def _pin_refs(fm: FileManager, refs: List[FileRef]) -> None:
-    with fm._ref_lock:
-        for r in refs:
-            key = r.path.name
-            fm._refs[key] = fm._refs.get(key, 0) + 1
+    fm.pin_refs(refs)
 
 
 def _unpin_refs(fm: FileManager, refs: List[FileRef]) -> None:
-    with fm._ref_lock:
-        for r in refs:
-            key = r.path.name
-            count = fm._refs.get(key, 0)
-            if count <= 1:
-                fm._refs.pop(key, None)
-            else:
-                fm._refs[key] = count - 1
+    fm.unpin_refs(refs)
 
 
 def merge_station_day(

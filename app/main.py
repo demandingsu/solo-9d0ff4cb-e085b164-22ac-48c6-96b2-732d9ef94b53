@@ -5,9 +5,9 @@ import contextlib
 from typing import List, Optional
 
 from fastapi import FastAPI, File, HTTPException, Path as PathParam, Query, UploadFile
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
-from . import db, services
+from . import db, services, station_changes
 from .config import settings
 from .errors import StorageError
 from .storage import file_manager
@@ -72,6 +72,83 @@ class ListBatchesResponse(BaseModel):
     batches: List[BatchInfo]
 
 
+# ------------------------------------------------- station-change schemas
+class StationChangeRequest(BaseModel):
+    old_station_id: str = Field(..., description="actual station before the switch")
+    new_station_id: str = Field(..., description="actual station from the switch on")
+    switch_minute: str = Field(
+        ...,
+        description=(
+            "UTC minute at which the new station takes over, e.g. "
+            "2026-11-12T12:34Z; the switch minute belongs to the new station"
+        ),
+    )
+
+
+class StationChangeUpdate(BaseModel):
+    old_station_id: Optional[str] = None
+    new_station_id: Optional[str] = None
+    switch_minute: Optional[str] = None
+
+
+class Window(BaseModel):
+    from_: str = Field(..., alias="from")
+    to_exclusive: str
+
+    model_config = {"populate_by_name": True}
+
+
+class StationChangeResponse(BaseModel):
+    registration_id: str
+    logical_station_id: str
+    day: str
+    old_station_id: str
+    new_station_id: str
+    switch_minute: str
+    old_window: Window
+    new_window: Window
+    version: int
+    created_at: str
+    updated_at: str
+
+
+class ListStationChangesResponse(BaseModel):
+    day: Optional[str]
+    registrations: List[StationChangeResponse]
+
+
+class LogicalRecord(BaseModel):
+    station_id: str
+    logical_station_id: str
+    segment: str
+    obs_time: str
+    rain_mm: float
+    source_batch_id: str
+
+
+class LogicalSegmentInfo(BaseModel):
+    station_id: str
+    window: Window
+    file_count: int
+    batch_ids: List[str]
+
+
+class LogicalQueryResponse(BaseModel):
+    logical_station_id: str
+    day: str
+    registration: StationChangeResponse
+    switch_minute: str
+    snapshot_token: str
+    old_station: LogicalSegmentInfo
+    new_station: LogicalSegmentInfo
+    file_count: int
+    batch_ids: List[str]
+    row_count: int
+    total_row_count: int
+    truncated: bool
+    records: List[LogicalRecord]
+
+
 # ---------------------------------------------------------------- app setup
 @contextlib.asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -87,10 +164,16 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="Rain Gauge Batch Storage API",
-    version="1.0.0",
+    version="1.1.0",
     description=(
         "Upload per-station/per-day rain CSV batches, compact them into one "
-        "Parquet file, and query published files with snapshot consistency."
+        "Parquet file, and query published files with snapshot consistency.\n\n"
+        "**Gauge replacement:** register a logical station/day with the old "
+        "actual station, the new actual station and the UTC switch minute, then "
+        "query `/logical-stations/.../records` to read one continuous series. "
+        "The old station is used strictly before the switch minute, the new "
+        "station from the switch minute on; duplicate rows, source batch ids "
+        "and actual station ids are preserved."
     ),
     lifespan=lifespan,
 )
@@ -185,3 +268,99 @@ def get_batches(
 @app.post("/admin/reap", tags=["ops"], summary="Force reaping of unreferenced superseded files")
 def force_reap() -> dict:
     return services.force_reap()
+
+
+# ------------------------------------------------- logical station endpoints
+LOGICAL_PATH = PathParam(..., pattern=r"^[A-Za-z0-9][A-Za-z0-9_\-]{0,63}$")
+
+
+@app.post(
+    "/logical-stations/{logical_station_id}/days/{day}/changes",
+    response_model=StationChangeResponse,
+    status_code=201,
+    tags=["station-change"],
+    summary="Register a gauge replacement (old station, new station, switch minute)",
+)
+def create_station_change(
+    logical_station_id: str = LOGICAL_PATH,
+    day: str = DAY_PATH,
+    body: StationChangeRequest = ...,
+) -> StationChangeResponse:
+    return StationChangeResponse(
+        **station_changes.register_station_change(
+            logical_station_id,
+            day,
+            body.old_station_id,
+            body.new_station_id,
+            body.switch_minute,
+        )
+    )
+
+
+@app.get(
+    "/logical-stations/{logical_station_id}/days/{day}/changes",
+    response_model=StationChangeResponse,
+    tags=["station-change"],
+    summary="Read the registered mapping for one logical station/day",
+)
+def get_station_change(
+    logical_station_id: str = LOGICAL_PATH,
+    day: str = DAY_PATH,
+) -> StationChangeResponse:
+    return StationChangeResponse(
+        **station_changes.get_station_change(logical_station_id, day)
+    )
+
+
+@app.put(
+    "/logical-stations/{logical_station_id}/days/{day}/changes",
+    response_model=StationChangeResponse,
+    tags=["station-change"],
+    summary="Modify a mapping; a conflicting modification leaves the old one usable",
+)
+def update_station_change(
+    logical_station_id: str = LOGICAL_PATH,
+    day: str = DAY_PATH,
+    body: StationChangeUpdate = ...,
+) -> StationChangeResponse:
+    return StationChangeResponse(
+        **station_changes.update_station_change(
+            logical_station_id,
+            day,
+            old_station_id=body.old_station_id,
+            new_station_id=body.new_station_id,
+            switch_minute=body.switch_minute,
+        )
+    )
+
+
+@app.get(
+    "/station-changes",
+    response_model=ListStationChangesResponse,
+    tags=["station-change"],
+    summary="List registered mappings (optionally filtered by UTC day)",
+)
+def list_station_changes(
+    day: Optional[str] = Query(None, pattern=r"^\d{4}-\d{2}-\d{2}$"),
+) -> ListStationChangesResponse:
+    return ListStationChangesResponse(
+        **station_changes.list_station_changes(day=day)
+    )
+
+
+@app.get(
+    "/logical-stations/{logical_station_id}/days/{day}/records",
+    response_model=LogicalQueryResponse,
+    tags=["station-change"],
+    summary="Query one logical station/day across the gauge replacement",
+)
+def query_logical_records(
+    logical_station_id: str = LOGICAL_PATH,
+    day: str = DAY_PATH,
+    limit: Optional[int] = Query(None, ge=0, description="optional row cap"),
+) -> LogicalQueryResponse:
+    return LogicalQueryResponse(
+        **station_changes.query_logical_day(
+            logical_station_id, day, limit=limit
+        )
+    )

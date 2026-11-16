@@ -48,6 +48,30 @@ CREATE TABLE IF NOT EXISTS merge_locks (
     locked_at   TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
     PRIMARY KEY (station_id, day)
 );
+
+-- Gauge-replacement registry. A logical station has at most one registration
+-- per UTC day. ``switch_minute`` is a canonical UTC minute
+-- (``YYYY-MM-DDTHH:MM:00Z``).
+CREATE TABLE IF NOT EXISTS station_changes (
+    registration_id     TEXT PRIMARY KEY,
+    logical_station_id  TEXT NOT NULL,
+    day                 TEXT NOT NULL,
+    old_station_id      TEXT NOT NULL,
+    new_station_id      TEXT NOT NULL,
+    switch_minute       TEXT NOT NULL,
+    version             INTEGER NOT NULL DEFAULT 1,
+    created_at          TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    updated_at          TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_station_changes_logical_day
+    ON station_changes (logical_station_id, day);
+
+CREATE INDEX IF NOT EXISTS idx_station_changes_day_old
+    ON station_changes (day, old_station_id);
+
+CREATE INDEX IF NOT EXISTS idx_station_changes_day_new
+    ON station_changes (day, new_station_id);
 """
 
 

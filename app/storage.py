@@ -25,6 +25,7 @@ import pyarrow.parquet as pq
 
 from . import db
 from .config import Settings, settings
+from .errors import QueryReadError
 
 
 @dataclass(frozen=True)
@@ -97,11 +98,20 @@ class FileManager:
         """Read and concatenate Parquet files.
 
         ``pyarrow.concat_tables`` preserves every row, including exact
-        duplicates, in the order the refs are given (publish order).
+        duplicates, in the order the refs are given (publish order).  Any read
+        failure aborts the whole call, so callers never see a partial result.
         """
         if not refs:
             return self.empty_table()
-        tables = [pq.read_table(r.path) for r in refs]
+        tables = []
+        for ref in refs:
+            try:
+                tables.append(pq.read_table(ref.path))
+            except Exception as exc:
+                raise QueryReadError(
+                    f"failed to read published batch {ref.batch_id} "
+                    f"({ref.path.name}): {exc}"
+                ) from exc
         return pa.concat_tables(tables, promote_options="default")
 
     @staticmethod
@@ -119,39 +129,55 @@ class FileManager:
     def open_snapshot(self, station_id: str, day: str) -> tuple[List[FileRef], str]:
         """Select the currently published file set and pin it.
 
-        The same file set is used from start to end of a query because the
-        reference is held for the query's whole lifetime.
+        Selection and pinning happen while holding the metadata write gate, so
+        a merge cannot supersede (and the reaper cannot unlink) a selected file
+        between the SELECT and the reference increment.  The same file set is
+        used from start to end of a query because the reference is held for the
+        query's whole lifetime.
         """
-        conn = db.connect()
-        try:
-            rows = conn.execute(
-                "SELECT batch_id, file_path, row_count, is_merged, created_at "
-                "FROM batches "
-                "WHERE station_id = ? AND day = ? AND status = 'published' "
-                "ORDER BY created_at ASC, rowid ASC",
-                (station_id, day),
-            ).fetchall()
-        finally:
-            conn.close()
+        with db.write_lock:
+            conn = db.connect()
+            try:
+                rows = conn.execute(
+                    "SELECT batch_id, file_path, row_count, is_merged, created_at "
+                    "FROM batches "
+                    "WHERE station_id = ? AND day = ? AND status = 'published' "
+                    "ORDER BY created_at ASC, rowid ASC",
+                    (station_id, day),
+                ).fetchall()
+            finally:
+                conn.close()
 
-        refs = [
-            FileRef(
-                batch_id=r["batch_id"],
-                path=Path(r["file_path"]),
-                row_count=r["row_count"],
-                is_merged=bool(r["is_merged"]),
-                created_at=r["created_at"],
-            )
-            for r in rows
-        ]
-        keys = [r.path.name for r in refs]
-        with self._ref_lock:
-            for key in keys:
-                self._refs[key] = self._refs.get(key, 0) + 1
+            refs = [
+                FileRef(
+                    batch_id=r["batch_id"],
+                    path=Path(r["file_path"]),
+                    row_count=r["row_count"],
+                    is_merged=bool(r["is_merged"]),
+                    created_at=r["created_at"],
+                )
+                for r in rows
+            ]
+            self.pin_refs(refs)
         token = f"{station_id}/{day}@{time.time_ns()}"
         return refs, token
 
     def close_snapshot(self, refs: List[FileRef]) -> None:
+        self.unpin_refs(refs)
+
+    def _active_ref_names(self) -> set[str]:
+        with self._ref_lock:
+            return set(self._refs.keys())
+
+    # Public pinning helpers. The logical-station query pins the file sets of
+    # two physical stations at once while holding the metadata write gate.
+    def pin_refs(self, refs: List[FileRef]) -> None:
+        with self._ref_lock:
+            for r in refs:
+                key = r.path.name
+                self._refs[key] = self._refs.get(key, 0) + 1
+
+    def unpin_refs(self, refs: List[FileRef]) -> None:
         with self._ref_lock:
             for r in refs:
                 key = r.path.name
@@ -160,10 +186,6 @@ class FileManager:
                     self._refs.pop(key, None)
                 else:
                     self._refs[key] = count - 1
-
-    def _active_ref_names(self) -> set[str]:
-        with self._ref_lock:
-            return set(self._refs.keys())
 
     # --------------------------------------------------------------- reaper
     def reap_once(self) -> list[str]:
